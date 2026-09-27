@@ -1,0 +1,598 @@
+---
+title: "Evaluating Physicochemical Drivers of River Flow Using Weighted Regression"
+author: "Kenshi King"
+date: "2025-11-28"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+## Data Set Credits
+
+Author: Daniel Fedorov
+
+Source: Kaggle
+
+```{r}
+#imports 
+library(tidyverse) #data wrangling
+library(ggplot2) #visualizations
+library(ggcorrplot) #correlation plots
+library(lmtest) #Breusch-Pagan test
+library(car) #vif, Box-Cox test, components + residuals plot
+library(caTools) #train/test split
+library(broom) #coefficient plot
+```
+
+```{r}
+sessionInfo()
+```
+
+```{r}
+list.files("figures")
+dir.create("figures", showWarnings = FALSE)
+```
+
+## Key
+
+This key contains relevant variables to our analysis and their units of
+measurement:
+
+1\. Average Water Speed (cm/s)
+
+2\. Average Water Direction (degrees)
+
+3\. Chlorophyll (ug/L)
+
+4\. Temperature (°C)
+
+5\. Dissolved Oxygen (mg/L)
+
+6\. Dissolved Oxygen (% Saturation)
+
+7\. pH
+
+8\. Salinity (ppm)
+
+9\. Specific Conductance (mS/cm)
+
+10\. Turbidity (Formazin Nephelometric Units (FNU))
+
+## Introduction
+
+This project examines a dataset provided by the Queensland Government
+Open Data Portal containing measurements of water physicochemcical
+parameters of the Brisbane River in Australia (Fedorov). The dataset
+includes timestamps, record numbers, and various characteristics of the
+river during a given instance. Using this data, we aim to test whether
+or not the average water speed is influenced by these river
+characteristics. Understanding water speed is crucial because it affects
+numerous things: river habitats and aquatic biodiversity, agriculture,
+hydroelectric power generation, erosion, flood risk management, and many
+others. Monitoring these speeds is tantamount to ensuring risk
+management and environmental protection (Fain).
+
+```{r}
+#Loading in our dataset
+df <- read_csv('brisbane_water_quality.csv')
+head(df)
+```
+
+## Section 1: Descriptive Statistics and Checking Assumptions 
+
+We begin our analysis by first examining some characteristics of the
+dataset. Descriptive statistics are helpful in arming us with useful
+data points as well as allowing us to detect potential outliers whether
+that be highly correlated variables or null values (NA). We will ignore
+columns Timestamp column as it may over complicate our analysis and the
+various [quality] columns due to their long stretch of null values. 
+
+```{r}
+water <- df %>% 
+  select(`Average Water Speed`, `Average Water Direction`, Chlorophyll, Temperature, `Dissolved Oxygen`, pH, Salinity, `Specific Conductance`, Turbidity)
+water
+```
+
+This dataset contains over 30,000 observations of the Brisbane River,
+capturing variation in the water's physicochemical parameters across
+30-minute intervals. Before cleaning, many variables contained a
+substantial amount of missing values, most notably temperature (5164
+missing), dissolved oxygen (4300 missing), salinity (3958 missing), and
+turbidity (2000 missing). After removing these rows to ensure we only
+have complete observations, the dataset retained the majority of its
+observations while dropping potential inconsistencies. (Potentially
+revise to fill the missing with avg or median values, depends on the gap
+lengths\*)
+
+```{r}
+clean_water <- na.omit(water)
+```
+
+```{r}
+#Uncleaned and cleaned placeholders
+water_plot <- water %>% 
+  select(`Average Water Speed`) %>% 
+           mutate(stage = "Before Cleaning")
+clean_water_plot <- clean_water %>% 
+  select(`Average Water Speed`) %>% 
+  mutate(stage = "After Cleaning")
+
+combined <- bind_rows(water_plot, clean_water_plot)
+
+combined$stage <- factor(combined$stage, levels = c("Before Cleaning", "After Cleaning"))
+
+ggplot(combined, aes(x = `Average Water Speed`)) + 
+  geom_histogram(binwidth=2, fill="blue", color="white") + 
+  facet_wrap(~stage) +
+  labs(title = "Distribtuon of Average",
+       x = NULL,
+       y = "Average Water Speed (cm/s)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+ggsave("figures/water_speed_distribution.png", 
+       plot = last_plot(),  # or replace with your saved plot object, e.g. speed_plot
+       width = 8, height = 5, dpi = 300)
+```
+
+Comparing the summary statistics before and after cleaning the data,
+some key trends slightly shifted, reflecting the removal of those
+null/extreme values. For instance, the mean average water speed
+decreased from \~16.80 to \~16.01, and the median from \~13.39 to
+\~12.33; the range remained wide, indicating some persistent extreme
+values. With regards to the other average water direction and the
+physicochemical parameters, they also exhibited minor changes. (Weighted
+regression will allow us to skip z-score scaling)
+
+Overall, the removal of these missing values slightly adjusted the
+descriptive statistics, retaining variability and the general patterns
+of the dataset. This version provides us with a more reliable starting
+point for further analysis.
+
+```{r}
+summary(water)
+```
+
+```{r}
+summary(clean_water)
+```
+
+## Section 2: Model Preparation and Fitting
+
+Here, we are interested in seeing if there are any variables with
+relationships that are a bit too strong. Highly correlated pairs can
+lead to multicollinearity, which can inflate standard errors and lower
+our model's estimates and predicting power. On a 0 to 1 scale, a common
+"rule-of-thumb" threshold is usually \<0.7, with any pairs going past
+this potentially indicating multicollinearity. As shown below, Salinity
+and Specific Conductance are extremely correlated (\~0.999), which makes
+sense logically as conductance of water is highly dependent on its salt
+contents so if a river is measured to have a high amount of salinity,
+its specific conductance will also be high. To address this, we will
+remove Specific Conductance from our model, retaining Salinity as its
+presenter. 
+
+```{r}
+cor(clean_water[,-c(1,9)])
+```
+
+```{r}
+predictors <- clean_water %>% 
+  select(`Average Water Direction`, Chlorophyll, Temperature, `Dissolved Oxygen`, pH, Salinity, `Specific Conductance`, Turbidity)
+corr_matrix <- cor(predictors)
+
+corr_plot <- ggcorrplot(corr_matrix, method = "square",
+           type = "lower",
+           lab = TRUE,
+           lab_size = 3,
+           colors = c("red", "white", "steelblue"),
+           title = "Correlation Matrix of Physicochemical Predictors",
+           ggtheme = theme_minimal()) + 
+  theme(axis.text.x = element_text(angle=45, hjust=1)) + 
+  theme(plot.title = element_text(hjust = 0.65))
+corr_plot
+ggsave("figures/correlation_heatmap_before.png", plot = corr_plot, width = 7, height = 6, dpi = 300) 
+```
+
+After we removed Specific Conductance, no pair of variables exceeded the
+0.7 threshold anymore. 
+
+```{r}
+cor(clean_water[,c(1,8)])
+```
+
+```{r}
+predictors_cleaned <- clean_water %>% 
+  select(`Average Water Direction`, Chlorophyll, Temperature, `Dissolved Oxygen`, pH, Salinity, Turbidity)
+corr_matrix <- cor(predictors_cleaned)
+
+corr_plot <- ggcorrplot(corr_matrix, method = "square",
+           type = "lower",
+           lab = TRUE,
+           lab_size = 3,
+           colors = c("red", "white", "steelblue"),
+           title = "Correlation Matrix of Physicochemical Predictors (Omitted Conductance)",
+           ggtheme = theme_minimal()) +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  theme(plot.title = element_text(hjust = 0.65))
+corr_plot
+ggsave("figures/correlation_heatmap_after.png", 
+       plot = corr_plot, 
+       width = 7, height = 6, dpi = 300)
+```
+
+We create a multiple linear regression model with Average Water Speed
+being our response variable and the remaining variables (Average Water
+Direction, Chlorophyll, Temperature, Dissolved Oxygen, pH, Salinity,
+Turbidity) as our predictors. We will approach this using manual
+selection, later using step-wise selection to assess if they align. 
+
+Looking at the output, we notice that the p-values for Average Water
+Direction (0.0971) and Temperature (p = 0.5361) exceeds the 0.05
+significance threshold, indicating that they may not significantly
+affect/predict average water direction; we will consider removing
+temperature first and refitting.
+
+```{r}
+model <- lm(`Average Water Speed` ~ `Average Water Direction` + Chlorophyll+Temperature+`Dissolved Oxygen`+pH+Salinity+Turbidity, data=clean_water) 
+summary(model) 
+```
+
+Upon refitting, Average Water Direction's p-value (0.0893) still exceeds
+the 0.05 threshold so we will remove it and refit once more.
+
+```{r}
+model2 <- lm(`Average Water Speed` ~ `Average Water Direction` + Chlorophyll+`Dissolved Oxygen`+pH+Salinity+Turbidity, data=clean_water) 
+summary(model2)
+```
+
+The tentative final model includes Chlorophyll, Dissolved Oxygen, pH,
+Salinity, and Turbidity. Temperature and Average Water Direction were
+excluded due to lack of significance. When using stepwise selection
+using Bayesian Information Criterion (BIC) penalty (since it scales with
+sample size), it resulted in the same model, indicating that this model
+provides a balance between goodness of fit and model complexity. 
+
+The adjusted R\^2 of 0.137 indicates that our model explains a moderate
+portion of variation in average water speed. Much of the remaining
+variability is likely driven by environmental factors not captured in
+this dataset. Regardless, our predictors' statistical significance do
+prove that they truly have an effect on determining average water speed,
+even if the model doesn't explain most of the variation. Rivers are
+inherently dynamic, as their flow can be strongly affected by a variety
+of external forces and conditions (Trent and Brown).
+
+```{r}
+full_model <- lm(`Average Water Speed`~Chlorophyll+`Dissolved Oxygen`+pH+Salinity+Turbidity, data=clean_water)
+summary(full_model)
+```
+
+```{r}
+step(model, direction="both", k=log(20028))
+```
+
+Furthermore, the Variance Inflation Factor (VIF) values for all
+predictors are well below the common threshold of 5, indicating that
+multicollinearity is not a concern of this model.
+
+```{r}
+vif(full_model)
+```
+
+## Section 3: Diagnostics
+
+In order to ensure the assumptions of our linear regression model are
+met, several diagnostic checks were performed. We are looking to confirm
+if the assumptions of linearity, constant variance, and normality of
+residuals are satisfied. The fitted values versus residuals was plotted
+to visually show if any patterns are recognized and we see that there is
+this downward, fanning of the point suggesting possible
+heteroscedasticity. The Breusch-Pagan Test (BP) yielded an extremely
+small p- value (\<2.2e-16), undeniably rejecting the null hypothesis of
+constant variance, confirming our suspicion of heteroscedasticity. 
+
+```{r}
+resid_df <- data.frame(fitted = full_model$fitted.values,
+                       residuals = full_model$residuals)
+
+resid_plot <- ggplot(resid_df, aes(x=fitted, y=residuals)) +
+  geom_point(alpha=0.4, color="steelblue") +
+  geom_hline(yintercept=0, color="firebrick", linetype="dashed") +
+  labs(title="Residuals vs. Fitted Values",
+       x="Fitted Values",
+       y="Residuals") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust=0.5))
+full_model$residuals
+resid_plot
+
+ggsave("figures/residuals_vs_fitted.png", 
+       plot = resid_plot, 
+       width = 7, height = 6, dpi = 300)
+```
+
+Our Q-Q plot shows a slightly exponential trend beginning to form about
+x-axis = 1, causing some deviation in our linearity assumption. Our
+Component + Residuals (crPlots) also agree with this deviation of
+linearity, indicating that some transformation may be necessary. 
+
+```{r}
+qq_plot <- ggplot(resid_df, aes(sample=residuals)) +
+    stat_qq(color="steelblue", alpha=0.5) +
+    stat_qq_line(color="firebrick", linetype="dashed") +
+    labs(title="Normal Q-Q Plot",
+         x="Theoretical Quantiles",
+         y="Sample Quantiles") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust=0.5))
+qq_plot
+ggsave("figures/qq_plot.png", 
+       plot = qq_plot, 
+       width = 7, height = 6, dpi = 300)
+```
+
+```{r}
+crPlots(full_model)
+cook <- cooks.distance(full_model)
+max(cook)
+```
+
+A Box-Cox transformation was performed to determine whether a power
+transformation to the response would improve model assumptions of
+linearity. The analysis suggested that the optimal lambda value is 1,
+indicating that no transformation is necessary. Therefore, the response
+variable is retained on its original scale.
+
+```{r}
+box_cox <- powerTransform(`Average Water Speed` ~Chlorophyll+`Dissolved Oxygen` +pH+Salinity+Turbidity, data=clean_water) 
+summary(box_cox) 
+```
+
+To address the issue of heteroscedasticity, we apply the Weighted Least
+Squares (WLS) to give less influence to observations with higher
+variance in residuals, resulting in more reliable coefficient estimates
+and improving the homoscedasticity assumption. 
+
+```{r}
+ols <- lm(`Average Water Speed` ~Chlorophyll+`Dissolved Oxygen` +pH+Salinity+Turbidity, data=clean_water)
+residual_sq <- resid(ols)^2
+var_model <- lm(residual_sq~fitted(ols))
+pred_var <- predict(var_model)
+weight <- (1/pred_var)
+wls <- lm(`Average Water Speed` ~Chlorophyll+`Dissolved Oxygen` +pH+Salinity+Turbidity, data=clean_water, weights=weight)
+summary(wls)
+```
+
+Since applying the WLS approach, the BP test yielded a higher p-value
+(0.000204), indicating that while some heteroscedasticity remains, the
+variance of residuals has improved compared to the original model. 
+
+```{r}
+bptest(wls)
+```
+
+Using the outlier test, we identified 10 observations with unusually
+high average water speeds that are extreme compared to the rest of the
+dataset. These values have the potential to unduly influence the
+regression results so we will remove them in an effort to improve model
+reliability. 
+
+```{r}
+outlierTest(wls)
+```
+
+```{r}
+outlier <- c(1,2,3340,3805,4104,3385,3524,3746,3938,5051,11844)
+clean_water[outlier,] 
+```
+
+```{r}
+final <- clean_water[!(seq_len(nrow(clean_water)) %in% outlier), ]
+final
+```
+
+```{r}
+final_ols <- lm(`Average Water Speed` ~Chlorophyll+`Dissolved Oxygen` +pH+Salinity+Turbidity, data=final)
+residual_sq <- resid(final_ols)^2
+var_model<-lm(residual_sq~fitted(final_ols))
+pred_var<- predict(var_model)
+final_weight <- (1/pred_var)
+```
+
+After refitting the final model, including the weight, the model still
+exhibits heteroscedasticity as it still fails to reject the BP test's
+null hypothesis. However, the weighted residuals indicate that
+heteroscedasticity has been reduced once more, reflected by the higher
+p-value (p \~ 0.00011) compared to the original (\<2.2e-16) and prior
+(0. 
+
+```{r}
+final_wls <- lm(`Average Water Speed` ~Chlorophyll+`Dissolved Oxygen` +pH+Salinity+Turbidity, data=final, weights=final_weight)
+bptest(final_wls)
+```
+
+## Section 4: Predictive Validation
+
+In order to assess whether or not the model generalizes beyond the data
+it was fit on, we implement a train/test split approach into a 80% and
+20% subset, respectively. The weighted least squares model was refit
+using only the training data, with weights recalculated with training
+residuals to avoid overlap with the test set. The fitted model was then
+used to predict Average Water Speed.
+
+```{r}
+#randomizing seed for reproducibility + 7 is lucky
+set.seed(777)
+
+#Split
+split <- sample.split(final$`Average Water Speed`, SplitRatio = 0.8)
+
+#Train/Test sets
+training_set <- subset(final, split == TRUE)
+test_set <- subset(final, split == FALSE)
+
+#Refit WLS on training data only
+train_ols <- lm(`Average Water Speed`~Chlorophyll+`Dissolved Oxygen`+pH+Salinity+Turbidity, data=training_set)
+train_resid_sq <- resid(train_ols)^2
+train_var_model <- lm(train_resid_sq~fitted(train_ols))
+train_pred_var <- predict(train_var_model)
+train_weight <- 1/train_pred_var
+train_wls <- lm(`Average Water Speed`~Chlorophyll+`Dissolved Oxygen`+pH+Salinity+Turbidity, data=training_set, weights=train_weight)
+summary(train_wls)
+
+#Test 
+test_pred <- predict(train_wls, newdata=test_set)
+
+#Results
+test_actual <- test_set$`Average Water Speed`
+rmse <- sqrt(mean((test_pred-test_actual)^2))
+mae <- mean(abs(test_pred-test_actual))
+
+rmse
+mae
+```
+
+The resulting test set RMSE was 12.02 cm/s and MAE was 8.98 cm/s. The
+RMSE aligns closely with the residual standard error of the original
+unweighted model (\~12.08 cm/s), suggesting that the model's predictive
+performance on unseen data is consistent with its in sample fit rather
+than reflecting overfitting.
+
+```{r}
+pred_df <- data.frame(actual = test_set$`Average Water Speed`,
+                      predicted = test_pred)
+
+pred_plot <- ggplot(pred_df, aes(x=actual, y=predicted)) +
+  geom_point(alpha=0.4, color="steelblue") +
+  geom_abline(slope=1, intercept=0, color="firebrick", linetype="dashed") +
+  labs(title="Predicted vs. Actual Average Water Speed (Test Set)", 
+       x="Actual Average Water Speed (cm/s)",
+       y="Predicted Average Water Speed (cm/s)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust=0.5))
+pred_plot
+ggsave("figures/predicted_vs_actual.png", 
+       plot = pred_plot, 
+       width = 7, height = 6, dpi = 300)
+```
+
+## Section 5: Analysis
+
+The final weighted least squares model depicts how Chlorophyll,
+Dissolved Oxygen, pH, Salinity, and Turbidity influence the average
+water speed of the Brisbane River. Within the parameter estimates, all
+coefficients are statistically significant at the 0.01 level, indicating
+well-supported points. Notably, dissolved oxygen has a strong negative
+effect (Estimate \~ -4.91), suggesting that higher oxygen levels are
+correlated with lower water speeds. pH displays a very strong, positive
+effect (Estimate 37.73), implying higher pH associates with faster water
+speeds. Salinity has a moderately negative effect (Estimate \~ -0.97),
+while Turbidity (Estimate\~ 0.25) and Chlorophyll (Estimate\~ -0.15)
+produced smaller but still significant effects. The model explains
+roughly 17.4% of variability in water speed, suggesting that other
+environmental factors not included within the dataset likely contribute
+to variation. 
+
+```{r}
+summary(final_wls)
+```
+
+```{r}
+coef_df <- tidy(final_wls, conf.int = TRUE) %>%
+  filter(term !="(Intercept)")
+
+coef_plot <- ggplot(coef_df, aes(x = estimate, y = reorder(term, estimate))) +
+  geom_point(color = "steelblue", size = 3) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), 
+                width = 0.2, color = "steelblue", orientation = "y") +
+  geom_vline(xintercept = 0, color = "firebrick", linetype = "dashed") +
+  labs(title = "Coefficient Estimates with 95% Confidence Intervals",
+       x = "Estimate",
+       y = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+coef_plot
+ggsave("figures/coefficient_plot.png", 
+       plot = coef_plot, 
+       width = 7, height = 5, dpi = 300)
+```
+
+```{r}
+plot(final_wls$fitted.values, final_wls$residuals)
+abline(h=0, col="red")
+```
+
+## Section 6: Limitations and Future Implementations
+
+While the final model provides statistically significant and
+interpretable relationships between physiochemical parameters and
+average water speed, several limitations should be acknowledged. First,
+the model explains only a modest portion of the variability in water
+speed (Adjusted R2 ≈ 0.174), suggesting that important drivers of river
+flow are not captured in this dataset. According to the research (Less
+et al. 1181), hydrological factors such as rainfall, tidal cycles, and
+upstream discharge volume are known to strongly influence river
+velocity. However, these were unavailable in the source data, and their
+absence likely accounts for much of the unexplained variance.
+
+Second, the time stamp variable was excluded from modeling to simplify
+the analysis, meaning temporal structure such as diurnal tidal patterns
+or seasonal variation, was not directly incorporated. Given that river
+flow is inherent interdependent, future work could explore this
+structure directly, either through time-series methods that account for
+autocorrelation between sequential 30-minute readings, or through
+mixed-effects models that treat time-of-day or season as structured
+random effects.
+
+Finally, the train/test validation performed did give us confirmation
+that the data generalizes well with unseen data, but this could be
+further extended using k-fold cross-validation to give us a greater
+range of estimates across many partitions to better defend our findings.
+
+## Conclusion
+
+This analysis provides a comprehensive assessment of how key
+physicochemical parameters influence the average water speed of the
+Brisbane River. Using multiple linear regression and rigidly considering
+model assumptions, we identified Chlorophyll, Dissolved Oxygen, pH,
+Salinity, and Turbidity as significant predictors of water speed. The
+Weighted Least Squares approach improved the reliability of coefficient
+estimates by reducing the influence of heteroscedasticity, and removal
+of extreme outliers further strengthened model stability. While the
+final model explains approximately 17.4% of the variability in water
+speed, the statistical significance of all predictors demonstrates that
+these environmental factors meaningfully contribute to river flow
+dynamics. Notably higher Dissolved Oxygen and Salinity are associated
+with slower flows, whereas higher pH and Turbidity relate to faster
+speeds, highlighting the various complex interactions of physicochemical
+properties in shaping river behavior.
+
+Overall, this model offers a robust and interpretable scheme for
+understanding river flow, emphasizing that while rivers are inherently
+dynamic and influenced by a multifaceted range of external factors,
+careful monitoring of these key parameters can provide valuable insights
+for environmental management, risk mitigation, and ecological
+preservation. 
+
+## Works Cited 
+
+1.  Fain, Jeremy. “Understanding Surface Water Speed in Rivers: Why It
+    Matters and How It’s Measured - Blue Water Intelligence (BWI).”
+    *Blue Water Intelligence (BWI)*, 8 Sept. 2025,
+    <https://bwi.earth/understanding-surface-water-speed-in-rivers-why-it-matters-and-how-its-measured/.>
+2.  Fedorov, Daniel. “Water Quality Monitoring Dataset.” *Kaggle.Com*,
+    2024,
+    <https://www.kaggle.com/datasets/downshift/water-quality-monitoring-dataset.>
+3.  Less, Diani F. S., et al. “Seasonal and Daily Variation of
+    Hydrodynamic Conditions in the Amazon River Mouth: Influence of
+    Discharge and Tide on Flow Velocity.” *Journal of Coastal Research*,
+    vol. 37, no. 6, Aug. 2021,
+    <https://doi.org/10.2112/jcoastres-d-21-00010.1.>
+4.  Trent, Roy, and Scott Brown. *An Overview of Factors Affecting River
+    Stability*. 30 Dec. 1984,
+    <https://onlinepubs.trb.org/Onlinepubs/trr/1984/950/950v2-017.pdf.>
+5.  Queensland Government. “Home." www.data.qld.gov.au, 23 Apr. 2020,
+    [www.data.qld.gov.au/.](https://www.data.qld.gov.au/dataset/brisbane-river-colmslie-site-water-quality-monitoring-buoy/resource/0ec4dacc-8e78-4c2a-aa70-d7865ec098e2)
+6.  Wickham, Hadley, and Garrett Grolemund. R for Data Science : Import,
+    Tidy, Transform, Visualize, and Model Data. O’reilly, 2017,
+    <https://r4ds.had.co.nz/index.html.>
