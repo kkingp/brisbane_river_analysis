@@ -40,9 +40,10 @@ Full code and output: [`code/brisbane_river_analysis.Rmd`](./code/brisbane_river
 
 ## Repository Structure
 ```
-├── report/    → Final written report (PDF)
 ├── code/      → R Markdown file, run alongside brisbane_water_quality.csv
-└── figures/   → Exported plots referenced in the report
+├── data/      → contains brisbane_water_quality.csv 
+├── figures/   → Exported plots referenced in the report
+└── report/    → Final written report (PDF)
 ```
 
 ## Data
